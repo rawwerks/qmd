@@ -1710,6 +1710,7 @@ type OutputOptions = {
   minScore: number;
   all?: boolean;
   collection?: string;  // Filter by collection name (pwd suffix match)
+  path?: string;  // Filter by path prefix within collection (e.g., "journals/")
   lineNumbers?: boolean; // Add line numbers to output
 };
 
@@ -1882,7 +1883,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   // searchFTS accepts collection name as number parameter for legacy reasons (will be fixed in store.ts)
-  const results = searchFTS(db, query, fetchLimit, collectionName as any);
+  const results = searchFTS(db, query, fetchLimit, collectionName as any, opts.path);
 
   // Add context to results
   const resultsWithContext = results.map(r => ({
@@ -1943,7 +1944,7 @@ async function vectorSearch(query: string, opts: OutputOptions, model: string = 
   const allResults = new Map<string, { file: string; displayPath: string; title: string; body: string; score: number; hash: string }>();
 
   for (const q of vectorQueries) {
-    const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any);
+    const vecResults = await searchVec(db, q, model, perQueryLimit, collectionName as any, opts.path);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -2032,7 +2033,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   checkIndexHealth(db);
 
   // Run initial BM25 search (will be reused for retrieval)
-  const initialFts = searchFTS(db, query, 20, collectionName as any);
+  const initialFts = searchFTS(db, query, 20, collectionName as any, opts.path);
   const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
 
   // Check if initial results have strong signals (skip expansion if so)
@@ -2085,7 +2086,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   }
   // Run expanded queries (skip first which is original)
   for (const q of ftsQueries.slice(1)) {
-    const ftsResults = searchFTS(db, q, 20, collectionName as any);
+    const ftsResults = searchFTS(db, q, 20, collectionName as any, opts.path);
     if (ftsResults.length > 0) {
       for (const r of ftsResults) hashMap.set(r.filepath, r.hash);
       rankedLists.push(ftsResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
@@ -2095,7 +2096,7 @@ async function querySearch(query: string, opts: OutputOptions, embedModel: strin
   // Vector searches with semantic queries + hyde
   if (hasVectors) {
     for (const q of vectorQueries) {
-      const vecResults = await searchVec(db, q, embedModel, 20, collectionName as any);
+      const vecResults = await searchVec(db, q, embedModel, 20, collectionName as any, opts.path);
       if (vecResults.length > 0) {
         for (const r of vecResults) hashMap.set(r.filepath, r.hash);
         rankedLists.push(vecResults.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score })));
@@ -2228,6 +2229,7 @@ function parseCLI() {
       files: { type: "boolean" },
       json: { type: "boolean" },
       collection: { type: "string", short: "c" },  // Filter by collection
+      path: { type: "string", short: "p" },  // Filter by path prefix within collection
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2270,6 +2272,7 @@ function parseCLI() {
     minScore: values["min-score"] ? parseFloat(values["min-score"]) || 0 : 0,
     all: isAll,
     collection: values.collection as string | undefined,
+    path: values.path as string | undefined,
     lineNumbers: values["line-numbers"] || false,
   };
 
@@ -2318,6 +2321,7 @@ function showHelp(): void {
   console.log("  --md                       - Markdown output");
   console.log("  --xml                      - XML output");
   console.log("  -c, --collection <name>    - Filter results to a specific collection");
+  console.log("  -p, --path <prefix>        - Filter results by path prefix (e.g., journals/)");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");

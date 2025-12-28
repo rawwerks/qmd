@@ -1646,7 +1646,7 @@ function buildFTS5Query(query: string): string | null {
   return terms.map(t => `"${t}"*`).join(' AND ');
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, pathFilter?: string): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -1671,6 +1671,12 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     // This code path is likely unused as collection filtering should be done at CLI level.
     sql += ` AND d.collection = ?`;
     params.push(String(collectionId));
+  }
+
+  if (pathFilter) {
+    // Filter by path prefix (e.g., "journals/" matches "journals/2024-01-01.md")
+    sql += ` AND d.path LIKE ?`;
+    params.push(`${pathFilter}%`);
   }
 
   // bm25 lower is better; sort ascending.
@@ -1704,7 +1710,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number, pathFilter?: string): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -1734,6 +1740,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
     // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
     sql += ` AND d.collection = ?`;
     sql = sql.replace('?', String(collectionId)); // Hacky but maintains compatibility
+  }
+
+  if (pathFilter) {
+    // Filter by path prefix (e.g., "journals/" matches "journals/2024-01-01.md")
+    sql += ` AND d.path LIKE '${pathFilter.replace(/'/g, "''")}%'`;
   }
 
   sql += ` ORDER BY v.distance`;
