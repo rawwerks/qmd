@@ -33,6 +33,8 @@ import {
   normalizeVirtualPath,
   isVirtualPath,
   parseVirtualPath,
+  normalizeDocid,
+  isDocid,
   type Store,
   type DocumentResult,
   type SearchResult,
@@ -353,12 +355,13 @@ describe("handelize", () => {
   });
 
   test("handles unicode characters", () => {
-    // Pure unicode with no alphanumerics throws error
-    expect(() => handelize("日本語.md")).toThrow("no valid filename content");
-    // Mixed unicode/ascii preserves the ascii parts
-    expect(handelize("café-notes.md")).toBe("caf-notes.md");
-    expect(handelize("naïve.md")).toBe("na-ve.md");
-    expect(handelize("日本語-notes.md")).toBe("notes.md");
+    // Pure unicode filenames are now supported (fixes GitHub issue #10)
+    expect(handelize("日本語.md")).toBe("日本語.md");
+    expect(handelize("Зоны и проекты.md")).toBe("зоны-и-проекты.md");
+    // Mixed unicode/ascii preserves both
+    expect(handelize("café-notes.md")).toBe("café-notes.md");
+    expect(handelize("naïve.md")).toBe("naïve.md");
+    expect(handelize("日本語-notes.md")).toBe("日本語-notes.md");
   });
 
   test("handles dates and times in filenames", () => {
@@ -528,8 +531,8 @@ describe("Document Chunking", () => {
     const content = "Small document content";
     const chunks = chunkDocument(content, 1000, 0);
     expect(chunks).toHaveLength(1);
-    expect(chunks[0].text).toBe(content);
-    expect(chunks[0].pos).toBe(0);
+    expect(chunks[0]!.text).toBe(content);
+    expect(chunks[0]!.pos).toBe(0);
   });
 
   test("chunkDocument splits large documents", () => {
@@ -539,9 +542,9 @@ describe("Document Chunking", () => {
 
     // All chunks should have correct positions
     for (let i = 0; i < chunks.length; i++) {
-      expect(chunks[i].pos).toBeGreaterThanOrEqual(0);
+      expect(chunks[i]!.pos).toBeGreaterThanOrEqual(0);
       if (i > 0) {
-        expect(chunks[i].pos).toBeGreaterThan(chunks[i - 1].pos);
+        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
       }
     }
   });
@@ -554,12 +557,12 @@ describe("Document Chunking", () => {
     // With overlap, positions should be closer together than without
     // Each new chunk starts 150 chars before where the previous one ended
     for (let i = 1; i < chunks.length; i++) {
-      const prevEnd = chunks[i - 1].pos + chunks[i - 1].text.length;
-      const currentStart = chunks[i].pos;
+      const prevEnd = chunks[i - 1]!.pos + chunks[i - 1]!.text.length;
+      const currentStart = chunks[i]!.pos;
       // Current chunk should start before the previous chunk ended (overlap)
       expect(currentStart).toBeLessThan(prevEnd);
       // But should still make forward progress
-      expect(currentStart).toBeGreaterThan(chunks[i - 1].pos);
+      expect(currentStart).toBeGreaterThan(chunks[i - 1]!.pos);
     }
   });
 
@@ -594,8 +597,8 @@ describe("Document Chunking", () => {
     const chunks = chunkDocument(content);
     expect(chunks.length).toBeGreaterThan(1);
     // Each chunk should be around 3200 chars (except last)
-    expect(chunks[0].text.length).toBeGreaterThan(2500);
-    expect(chunks[0].text.length).toBeLessThanOrEqual(3200);
+    expect(chunks[0]!.text.length).toBeGreaterThan(2500);
+    expect(chunks[0]!.text.length).toBeLessThanOrEqual(3200);
   });
 });
 
@@ -604,10 +607,10 @@ describe("Token-based Chunking", () => {
     const content = "This is a small document.";
     const chunks = await chunkDocumentByTokens(content, 800, 120);
     expect(chunks).toHaveLength(1);
-    expect(chunks[0].text).toBe(content);
-    expect(chunks[0].pos).toBe(0);
-    expect(chunks[0].tokens).toBeGreaterThan(0);
-    expect(chunks[0].tokens).toBeLessThan(800);
+    expect(chunks[0]!.text).toBe(content);
+    expect(chunks[0]!.pos).toBe(0);
+    expect(chunks[0]!.tokens).toBeGreaterThan(0);
+    expect(chunks[0]!.tokens).toBeLessThan(800);
   });
 
   test("chunkDocumentByTokens splits large documents", async () => {
@@ -625,9 +628,9 @@ describe("Token-based Chunking", () => {
 
     // Chunks should have correct positions
     for (let i = 0; i < chunks.length; i++) {
-      expect(chunks[i].pos).toBeGreaterThanOrEqual(0);
+      expect(chunks[i]!.pos).toBeGreaterThanOrEqual(0);
       if (i > 0) {
-        expect(chunks[i].pos).toBeGreaterThan(chunks[i - 1].pos);
+        expect(chunks[i]!.pos).toBeGreaterThan(chunks[i - 1]!.pos);
       }
     }
   });
@@ -640,8 +643,8 @@ describe("Token-based Chunking", () => {
 
     // With overlap, consecutive chunks should have overlapping positions
     for (let i = 1; i < chunks.length; i++) {
-      const prevEnd = chunks[i - 1].pos + chunks[i - 1].text.length;
-      const currentStart = chunks[i].pos;
+      const prevEnd = chunks[i - 1]!.pos + chunks[i - 1]!.text.length;
+      const currentStart = chunks[i]!.pos;
       // Current chunk should start before the previous chunk ended (overlap)
       expect(currentStart).toBeLessThan(prevEnd);
     }
@@ -653,8 +656,8 @@ describe("Token-based Chunking", () => {
 
     expect(chunks).toHaveLength(1);
     // The token count should be reasonable (not 0, not equal to char count)
-    expect(chunks[0].tokens).toBeGreaterThan(0);
-    expect(chunks[0].tokens).toBeLessThan(content.length);  // Tokens < chars for English
+    expect(chunks[0]!.tokens).toBeGreaterThan(0);
+    expect(chunks[0]!.tokens).toBeLessThan(content.length);  // Tokens < chars for English
   });
 });
 
@@ -805,9 +808,9 @@ describe("FTS Search", () => {
 
     const results = store.searchFTS("fox", 10);
     expect(results.length).toBeGreaterThan(0);
-    expect(results[0].displayPath).toBe(`${collectionName}/test/doc1.md`);
-    expect(results[0].filepath).toBe(`qmd://${collectionName}/test/doc1.md`);
-    expect(results[0].source).toBe("fts");
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/doc1.md`);
+    expect(results[0]!.filepath).toBe(`qmd://${collectionName}/test/doc1.md`);
+    expect(results[0]!.source).toBe("fts");
 
     await cleanupTestDb(store);
   });
@@ -836,7 +839,7 @@ describe("FTS Search", () => {
     // Both documents contain "fox" in the body now, so we should get 2 results
     expect(results.length).toBe(2);
     // Title/name match should rank higher due to BM25 weights
-    expect(results[0].displayPath).toBe(`${collectionName}/test/title.md`);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/title.md`);
 
     await cleanupTestDb(store);
   });
@@ -883,7 +886,7 @@ describe("FTS Search", () => {
     // Filter by collection name (collectionId is now treated as collection name string)
     const filtered = store.searchFTS("searchable", 10, collection1 as unknown as number);
     expect(filtered).toHaveLength(1);
-    expect(filtered[0].displayPath).toBe(`${collection1}/doc1.md`);
+    expect(filtered[0]!.displayPath).toBe(`${collection1}/doc1.md`);
 
     await cleanupTestDb(store);
   });
@@ -925,8 +928,8 @@ describe("FTS Search", () => {
 
     const results = store.searchFTS("findme", 10);
     expect(results).toHaveLength(1);
-    expect(results[0].displayPath).toBe(`${collectionName}/test/active.md`);
-    expect(results[0].filepath).toBe(`qmd://${collectionName}/test/active.md`);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/test/active.md`);
+    expect(results[0]!.filepath).toBe(`qmd://${collectionName}/test/active.md`);
 
     await cleanupTestDb(store);
   });
@@ -1231,9 +1234,9 @@ describe("Document Retrieval", () => {
 
       const { docs } = store.findDocuments("large.md", { maxBytes: 10000 });
       expect(docs).toHaveLength(1);
-      expect(docs[0].skipped).toBe(true);
-      if (docs[0].skipped) {
-        expect(docs[0].skipReason).toContain("too large");
+      expect(docs[0]!.skipped).toBe(true);
+      if (docs[0]!.skipped) {
+        expect((docs[0] as { skipped: true; skipReason: string }).skipReason).toContain("too large");
       }
 
       await cleanupTestDb(store);
@@ -1251,9 +1254,9 @@ describe("Document Retrieval", () => {
       });
 
       const { docs } = store.findDocuments("doc1.md", { includeBody: true });
-      expect(docs[0].skipped).toBe(false);
-      if (!docs[0].skipped) {
-        expect(docs[0].doc.body).toBe("The content");
+      expect(docs[0]!.skipped).toBe(false);
+      if (!docs[0]!.skipped) {
+        expect((docs[0] as { doc: { body: string }; skipped: false }).doc.body).toBe("The content");
       }
 
       await cleanupTestDb(store);
@@ -1339,10 +1342,10 @@ describe("Snippet Extraction", () => {
     expect(headerMatch).not.toBeNull();
 
     const [, startLine, count, before, after] = headerMatch!;
-    expect(parseInt(startLine)).toBe(2); // Snippet starts at line 2 (B)
-    expect(parseInt(count)).toBe(4);     // 4 lines: B, C keyword, D, E
-    expect(parseInt(before)).toBe(1);    // A is before
-    expect(parseInt(after)).toBe(3);     // F, G, H are after
+    expect(parseInt(startLine!)).toBe(2); // Snippet starts at line 2 (B)
+    expect(parseInt(count!)).toBe(4);     // 4 lines: B, C keyword, D, E
+    expect(parseInt(before!)).toBe(1);    // A is before
+    expect(parseInt(after!)).toBe(3);     // F, G, H are after
   });
 
   test("extractSnippet at document start shows 0 before", () => {
@@ -1412,9 +1415,9 @@ describe("Reciprocal Rank Fusion", () => {
     const fused = reciprocalRankFusion([list1]);
 
     // Order should be preserved
-    expect(fused[0].file).toBe("doc1");
-    expect(fused[1].file).toBe("doc2");
-    expect(fused[2].file).toBe("doc3");
+    expect(fused[0]!.file).toBe("doc1");
+    expect(fused[1]!.file).toBe("doc2");
+    expect(fused[2]!.file).toBe("doc3");
   });
 
   test("RRF merges documents from multiple lists", () => {
@@ -1437,7 +1440,7 @@ describe("Reciprocal Rank Fusion", () => {
     const fused = reciprocalRankFusion([list1, list2], [2.0, 1.0]);
 
     // doc1 should rank higher due to weight
-    expect(fused[0].file).toBe("doc1");
+    expect(fused[0]!.file).toBe("doc1");
   });
 
   test("RRF adds top-rank bonus", () => {
@@ -1468,7 +1471,7 @@ describe("Reciprocal Rank Fusion", () => {
     const fused30 = reciprocalRankFusion([list], [], 30);
 
     // Lower k = higher scores for top ranks
-    expect(fused30[0].score).toBeGreaterThan(fused60[0].score);
+    expect(fused30[0]!.score).toBeGreaterThan(fused60[0]!.score);
   });
 });
 
@@ -1746,12 +1749,12 @@ describe("Integration", () => {
     const results2 = store2.searchFTS("different", 10);
 
     expect(results1).toHaveLength(1);
-    expect(results1[0].displayPath).toBe("store1/doc.md");
-    expect(results1[0].filepath).toBe("qmd://store1/doc.md");
+    expect(results1[0]!.displayPath).toBe("store1/doc.md");
+    expect(results1[0]!.filepath).toBe("qmd://store1/doc.md");
 
     expect(results2).toHaveLength(1);
-    expect(results2[0].displayPath).toBe("store2/doc.md");
-    expect(results2[0].filepath).toBe("qmd://store2/doc.md");
+    expect(results2[0]!.displayPath).toBe("store2/doc.md");
+    expect(results2[0]!.filepath).toBe("qmd://store2/doc.md");
 
     // Cross-check: store1 shouldn't find store2's content
     const cross1 = store1.searchFTS("different", 10);
@@ -1806,9 +1809,86 @@ describe("LlamaCpp Integration", () => {
 
     const results = await store.searchVec("test query", "embeddinggemma", 10);
     expect(results).toHaveLength(1);
-    expect(results[0].displayPath).toBe(`${collectionName}/doc1.md`);
-    expect(results[0].filepath).toBe(`qmd://${collectionName}/doc1.md`);
-    expect(results[0].source).toBe("vec");
+    expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
+    expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
+    expect(results[0]!.source).toBe("vec");
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec filters by collection name", async () => {
+    const store = await createTestStore();
+    const collection1 = await createTestCollection({ name: "coll1", pwd: "/test/coll1" });
+    const collection2 = await createTestCollection({ name: "coll2", pwd: "/test/coll2" });
+
+    const hash1 = "hash1abc";
+    const hash2 = "hash2xyz";
+
+    await insertTestDocument(store.db, collection1, {
+      name: "doc1",
+      hash: hash1,
+      body: "Content in collection one",
+    });
+
+    await insertTestDocument(store.db, collection2, {
+      name: "doc2",
+      hash: hash2,
+      body: "Content in collection two",
+    });
+
+    // Create vectors_vec table with correct dimensions (768 for embeddinggemma)
+    store.ensureVecTable(768);
+    const embedding1 = Array(768).fill(0).map(() => Math.random());
+    const embedding2 = Array(768).fill(0).map(() => Math.random());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash1, new Date().toISOString());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash2, new Date().toISOString());
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash1}_0`, new Float32Array(embedding1));
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash2}_0`, new Float32Array(embedding2));
+
+    // Search without filter - should return both
+    const allResults = await store.searchVec("content", "embeddinggemma", 10);
+    expect(allResults).toHaveLength(2);
+
+    // Search with collection filter - should return only from collection1
+    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1 as unknown as number);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]!.collectionName).toBe(collection1);
+
+    await cleanupTestDb(store);
+  });
+
+  // Regression test for https://github.com/tobi/qmd/pull/23
+  // sqlite-vec virtual tables hang when combined with JOINs in the same query.
+  // The fix uses a two-step approach: vector query first, then separate JOINs.
+  test("searchVec uses two-step query to avoid sqlite-vec JOIN hang", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    const hash = "regression_test_hash";
+    await insertTestDocument(store.db, collectionName, {
+      name: "regression-doc",
+      hash,
+      body: "Test content for vector search regression",
+      filepath: "/test/regression.md",
+      displayPath: "regression.md",
+    });
+
+    // Create vector table and insert a test vector
+    store.ensureVecTable(768);
+    const embedding = Array(768).fill(0).map(() => Math.random());
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
+
+    // This should complete quickly (not hang) due to the two-step fix
+    // The old code with JOINs in the sqlite-vec query would hang indefinitely
+    const startTime = Date.now();
+    const results = await store.searchVec("test content", "embeddinggemma", 5);
+    const elapsed = Date.now() - startTime;
+
+    // If the query took more than 5 seconds, something is wrong
+    // (the hang bug would cause it to never return at all)
+    expect(elapsed).toBeLessThan(5000);
+    expect(results.length).toBeGreaterThan(0);
 
     await cleanupTestDb(store);
   });
@@ -1849,7 +1929,7 @@ describe("LlamaCpp Integration", () => {
     const results = await store.rerank("topic", docs);
     expect(results).toHaveLength(2);
     // LlamaCpp reranker returns relevance scores
-    expect(results[0].score).toBeGreaterThan(0);
+    expect(results[0]!.score).toBeGreaterThan(0);
 
     await cleanupTestDb(store);
   });
@@ -2106,7 +2186,7 @@ describe("Content-Addressable Storage", () => {
     // All documents should point to the same hash
     const hashes = store.db.prepare(`SELECT DISTINCT hash FROM documents WHERE active = 1`).all() as { hash: string }[];
     expect(hashes).toHaveLength(1);
-    expect(hashes[0].hash).toBe(sharedHash);
+    expect(hashes[0]!.hash).toBe(sharedHash);
 
     await cleanupTestDb(store);
   });
@@ -2296,5 +2376,108 @@ describe("parseVirtualPath", () => {
     expect(parseVirtualPath("file.md")).toBe(null);
     // Bare collection/path is not recognized as virtual
     expect(parseVirtualPath("collection/path.md")).toBe(null);
+  });
+});
+
+// =============================================================================
+// Docid Functions
+// =============================================================================
+
+describe("normalizeDocid", () => {
+  test("strips leading # from docid", () => {
+    expect(normalizeDocid("#abc123")).toBe("abc123");
+    expect(normalizeDocid("#def456")).toBe("def456");
+  });
+
+  test("returns bare hex unchanged", () => {
+    expect(normalizeDocid("abc123")).toBe("abc123");
+    expect(normalizeDocid("def456")).toBe("def456");
+  });
+
+  test("strips surrounding double quotes", () => {
+    expect(normalizeDocid('"#abc123"')).toBe("abc123");
+    expect(normalizeDocid('"abc123"')).toBe("abc123");
+  });
+
+  test("strips surrounding single quotes", () => {
+    expect(normalizeDocid("'#abc123'")).toBe("abc123");
+    expect(normalizeDocid("'abc123'")).toBe("abc123");
+  });
+
+  test("handles quoted docid without #", () => {
+    expect(normalizeDocid('"def456"')).toBe("def456");
+    expect(normalizeDocid("'def456'")).toBe("def456");
+  });
+
+  test("handles whitespace", () => {
+    expect(normalizeDocid("  #abc123  ")).toBe("abc123");
+    expect(normalizeDocid("  abc123  ")).toBe("abc123");
+  });
+
+  test("handles uppercase hex", () => {
+    expect(normalizeDocid("#ABC123")).toBe("ABC123");
+    expect(normalizeDocid('"ABC123"')).toBe("ABC123");
+  });
+
+  test("does not strip mismatched quotes", () => {
+    expect(normalizeDocid('"abc123\'')).toBe('"abc123\'');
+    expect(normalizeDocid("'abc123\"")).toBe("'abc123\"");
+  });
+});
+
+describe("isDocid", () => {
+  test("accepts #hash format", () => {
+    expect(isDocid("#abc123")).toBe(true);
+    expect(isDocid("#def456")).toBe(true);
+    expect(isDocid("#ABCDEF")).toBe(true);
+  });
+
+  test("accepts bare 6-char hex", () => {
+    expect(isDocid("abc123")).toBe(true);
+    expect(isDocid("def456")).toBe(true);
+    expect(isDocid("ABCDEF")).toBe(true);
+  });
+
+  test("accepts longer hex strings", () => {
+    expect(isDocid("abc123def456")).toBe(true);
+    expect(isDocid("#abc123def456")).toBe(true);
+  });
+
+  test("accepts double-quoted docids", () => {
+    expect(isDocid('"#abc123"')).toBe(true);
+    expect(isDocid('"abc123"')).toBe(true);
+  });
+
+  test("accepts single-quoted docids", () => {
+    expect(isDocid("'#abc123'")).toBe(true);
+    expect(isDocid("'abc123'")).toBe(true);
+  });
+
+  test("rejects non-hex strings", () => {
+    expect(isDocid("ghijkl")).toBe(false);
+    expect(isDocid("#ghijkl")).toBe(false);
+    expect(isDocid("abc12g")).toBe(false);
+  });
+
+  test("rejects strings shorter than 6 chars", () => {
+    expect(isDocid("abc12")).toBe(false);
+    expect(isDocid("#abc1")).toBe(false);
+    expect(isDocid("'abc'")).toBe(false);
+  });
+
+  test("rejects empty strings", () => {
+    expect(isDocid("")).toBe(false);
+    expect(isDocid("#")).toBe(false);
+    expect(isDocid('""')).toBe(false);
+  });
+
+  test("rejects file paths", () => {
+    expect(isDocid("/path/to/file.md")).toBe(false);
+    expect(isDocid("path/to/file.md")).toBe(false);
+    expect(isDocid("qmd://collection/file.md")).toBe(false);
+  });
+
+  test("rejects paths that look like hex with extensions", () => {
+    expect(isDocid("abc123.md")).toBe(false);
   });
 });

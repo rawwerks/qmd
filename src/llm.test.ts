@@ -84,7 +84,7 @@ describe("LlamaCpp Integration", () => {
 
       // Embeddings should be identical for the same input
       for (let i = 0; i < result1!.embedding.length; i++) {
-        expect(result1!.embedding[i]).toBeCloseTo(result2!.embedding[i], 5);
+        expect(result1!.embedding[i]).toBeCloseTo(result2!.embedding[i]!, 5);
       }
     });
 
@@ -100,9 +100,11 @@ describe("LlamaCpp Integration", () => {
       let norm1 = 0;
       let norm2 = 0;
       for (let i = 0; i < result1!.embedding.length; i++) {
-        dotProduct += result1!.embedding[i] * result2!.embedding[i];
-        norm1 += result1!.embedding[i] ** 2;
-        norm2 += result2!.embedding[i] ** 2;
+        const v1 = result1!.embedding[i]!;
+        const v2 = result2!.embedding[i]!;
+        dotProduct += v1 * v2;
+        norm1 += v1 ** 2;
+        norm2 += v2 ** 2;
       }
       const similarity = dotProduct / (Math.sqrt(norm1) * Math.sqrt(norm2));
 
@@ -136,7 +138,7 @@ describe("LlamaCpp Integration", () => {
         expect(batchResults[i]).not.toBeNull();
         expect(individualResults[i]).not.toBeNull();
         for (let j = 0; j < batchResults[i]!.embedding.length; j++) {
-          expect(batchResults[i]!.embedding[j]).toBeCloseTo(individualResults[i]!.embedding[j], 5);
+          expect(batchResults[i]!.embedding[j]).toBeCloseTo(individualResults[i]!.embedding[j]!, 5);
         }
       }
     });
@@ -165,6 +167,63 @@ describe("LlamaCpp Integration", () => {
       // Performance is machine/load dependent. We only assert batch isn't drastically worse.
       expect(batchTime).toBeLessThanOrEqual(seqTime * 3);
     });
+
+    test("handles concurrent embedBatch calls on fresh instance without race condition", async () => {
+      // This test verifies the fix for a race condition where concurrent calls to
+      // ensureEmbedContext() could create multiple contexts. Without the promise guard,
+      // each concurrent embedBatch call sees embedContext === null and creates its own
+      // context, causing resource leaks and potential "Context is disposed" errors.
+      //
+      // See: https://github.com/tobi/qmd/pull/54
+      //
+      // The fix uses a promise guard to ensure only one context creation runs at a time.
+      // We verify this by instrumenting createEmbeddingContext to count invocations.
+      
+      const freshLlm = new LlamaCpp({});
+      let contextCreateCount = 0;
+      
+      // Instrument the model's createEmbeddingContext to count calls
+      const originalEnsureEmbedModel = (freshLlm as any).ensureEmbedModel.bind(freshLlm);
+      let modelInstrumented = false;
+      (freshLlm as any).ensureEmbedModel = async function() {
+        const model = await originalEnsureEmbedModel();
+        if (!modelInstrumented) {
+          modelInstrumented = true;
+          const originalCreate = model.createEmbeddingContext.bind(model);
+          model.createEmbeddingContext = async function(...args: any[]) {
+            contextCreateCount++;
+            return originalCreate(...args);
+          };
+        }
+        return model;
+      };
+      
+      const texts = Array(10).fill(null).map((_, i) => `Document ${i}`);
+
+      // Call embedBatch 5 TIMES in parallel on fresh instance.
+      // Without the promise guard fix, this would create 5 contexts (one per call).
+      // With the fix, only 1 context should be created.
+      const batches = await Promise.all([
+        freshLlm.embedBatch(texts.slice(0, 2)),
+        freshLlm.embedBatch(texts.slice(2, 4)),
+        freshLlm.embedBatch(texts.slice(4, 6)),
+        freshLlm.embedBatch(texts.slice(6, 8)),
+        freshLlm.embedBatch(texts.slice(8, 10)),
+      ]);
+
+      const allResults = batches.flat();
+      expect(allResults).toHaveLength(10);
+      
+      const successCount = allResults.filter(r => r !== null).length;
+      expect(successCount).toBe(10);
+
+      // THE KEY ASSERTION: Only 1 context should be created, not 5
+      // Without the fix, contextCreateCount would be 5 (one per concurrent embedBatch call)
+      console.log(`Context creation count: ${contextCreateCount} (expected: 1)`);
+      expect(contextCreateCount).toBe(1);
+      
+      await freshLlm.dispose();
+    }, 60000);
   });
 
   describe("rerank", () => {
@@ -181,15 +240,15 @@ describe("LlamaCpp Integration", () => {
       expect(result.results).toHaveLength(3);
 
       // The France document should score highest
-      expect(result.results[0].file).toBe("france.txt");
-      expect(result.results[0].score).toBeGreaterThan(0.7);
+      expect(result.results[0]!.file).toBe("france.txt");
+      expect(result.results[0]!.score).toBeGreaterThan(0.7);
 
       // Canada should be somewhat relevant (also about capitals)
-      expect(result.results[1].file).toBe("canada.txt");
+      expect(result.results[1]!.file).toBe("canada.txt");
 
       // Butterflies should score lowest
-      expect(result.results[2].file).toBe("butterflies.txt");
-      expect(result.results[2].score).toBeLessThan(0.6);
+      expect(result.results[2]!.file).toBe("butterflies.txt");
+      expect(result.results[2]!.score).toBeLessThan(0.6);
     });
 
     test("scores authentication query correctly", async () => {
@@ -227,12 +286,12 @@ describe("LlamaCpp Integration", () => {
       const result = await llm.rerank(query, documents);
 
       // JavaScript errors doc should score highest
-      expect(result.results[0].file).toBe("errors.md");
-      expect(result.results[0].score).toBeGreaterThan(0.7);
+      expect(result.results[0]!.file).toBe("errors.md");
+      expect(result.results[0]!.score).toBeGreaterThan(0.7);
 
       // Python doc might be somewhat relevant (same concept, different language)
       // Cooking should be least relevant
-      expect(result.results[2].file).toBe("cooking.md");
+      expect(result.results[2]!.file).toBe("cooking.md");
     });
 
     test("handles empty document list", async () => {
@@ -243,7 +302,7 @@ describe("LlamaCpp Integration", () => {
     test("handles single document", async () => {
       const result = await llm.rerank("test", [{ file: "doc.md", text: "content" }]);
       expect(result.results).toHaveLength(1);
-      expect(result.results[0].file).toBe("doc.md");
+      expect(result.results[0]!.file).toBe("doc.md");
     });
 
     test("preserves original file paths", async () => {
@@ -300,17 +359,25 @@ describe("LlamaCpp Integration", () => {
   });
 
   describe("expandQuery", () => {
-    test("returns at least the original query", async () => {
+    test("returns query expansions with correct types", async () => {
       const result = await llm.expandQuery("test query");
 
-      expect(result).toContain("test query");
+      // Result is Queryable[] containing lex, vec, and/or hyde entries
       expect(result.length).toBeGreaterThanOrEqual(1);
+
+      // Each result should have a valid type
+      for (const q of result) {
+        expect(["lex", "vec", "hyde"]).toContain(q.type);
+        expect(q.text.length).toBeGreaterThan(0);
+      }
     }, 30000); // 30s timeout for model loading
 
-    test("returns original query first", async () => {
-      const result = await llm.expandQuery("authentication setup");
+    test("can exclude lexical queries", async () => {
+      const result = await llm.expandQuery("authentication setup", { includeLexical: false });
 
-      expect(result[0]).toBe("authentication setup");
+      // Should not contain any 'lex' type entries
+      const lexEntries = result.filter(q => q.type === "lex");
+      expect(lexEntries).toHaveLength(0);
     });
   });
 });

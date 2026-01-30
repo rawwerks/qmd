@@ -11,6 +11,13 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # SQLite with loadable extension support for sqlite-vec
+        sqliteWithExtensions = pkgs.sqlite.overrideAttrs (old: {
+          configureFlags = (old.configureFlags or []) ++ [
+            "--enable-load-extension"
+          ];
+        });
+
         qmd = pkgs.stdenv.mkDerivation {
           pname = "qmd";
           version = "1.0.0";
@@ -31,11 +38,11 @@
             mkdir -p $out/bin
 
             cp -r node_modules $out/lib/qmd/
-            cp qmd.ts $out/lib/qmd/
+            cp -r src $out/lib/qmd/
             cp package.json $out/lib/qmd/
 
             makeWrapper ${pkgs.bun}/bin/bun $out/bin/qmd \
-              --add-flags "$out/lib/qmd/qmd.ts" \
+              --add-flags "$out/lib/qmd/src/qmd.ts" \
               --set DYLD_LIBRARY_PATH "${pkgs.sqlite.out}/lib" \
               --set LD_LIBRARY_PATH "${pkgs.sqlite.out}/lib"
           '';
@@ -62,12 +69,13 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pkgs.bun
-            pkgs.sqlite
+            sqliteWithExtensions
           ];
 
           shellHook = ''
+            export BREW_PREFIX="''${BREW_PREFIX:-${sqliteWithExtensions.out}}"
             echo "QMD development shell"
-            echo "Run: bun qmd.ts <command>"
+            echo "Run: bun src/qmd.ts <command>"
           '';
         };
       }
