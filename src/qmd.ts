@@ -2,6 +2,7 @@
 import { Database } from "bun:sqlite";
 import { Glob, $ } from "bun";
 import { parseArgs } from "util";
+import { readFileSync, statSync } from "fs";
 import * as sqliteVec from "sqlite-vec";
 import {
   getPwd,
@@ -65,7 +66,7 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
+import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
 import {
   formatSearchResults,
@@ -81,6 +82,7 @@ import {
   removeContext as yamlRemoveContext,
   setGlobalContext,
   listAllContexts,
+  setConfigIndexName,
 } from "./collections.js";
 
 // Enable production mode - allows using default database path
@@ -281,7 +283,7 @@ function showStatus(): void {
   // Index size
   let indexSize = 0;
   try {
-    const stat = Bun.file(dbPath).size;
+    const stat = statSync(dbPath).size;
     indexSize = stat;
   } catch { }
 
@@ -1401,7 +1403,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
-    const content = await Bun.file(filepath).text();
+    const content = readFileSync(filepath, "utf-8");
 
     // Skip empty files - nothing useful to index
     if (!content.trim()) {
@@ -1427,7 +1429,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       } else {
         // Content changed - insert new content hash and update document
         insertContent(db, hash, content, now);
-        const stat = await Bun.file(filepath).stat();
+        const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
           stat ? new Date(stat.mtime).toISOString() : now);
         updated++;
@@ -1436,7 +1438,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
       // New document - insert content and document
       indexed++;
       insertContent(db, hash, content, now);
-      const stat = await Bun.file(filepath).stat();
+      const stat = statSync(filepath);
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
@@ -2291,6 +2293,9 @@ function parseCLI() {
     args: Bun.argv.slice(2), // Skip bun and script path
     options: {
       // Global options
+      index: {
+        type: "string",
+      },
       context: {
         type: "string",
       },
@@ -2316,6 +2321,7 @@ function parseCLI() {
       force: { type: "boolean", short: "f" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
+      refresh: { type: "boolean" },
       // Get options
       l: { type: "string" },  // max lines
       from: { type: "string" },  // start line
@@ -2330,6 +2336,7 @@ function parseCLI() {
   const indexName = values.index as string | undefined;
   if (indexName) {
     setIndexName(indexName);
+    setConfigIndexName(indexName);
   }
 
   // Determine output format
@@ -2594,6 +2601,26 @@ if (import.meta.main) {
     case "embed":
       await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
       break;
+
+    case "pull": {
+      const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
+      const models = [
+        DEFAULT_EMBED_MODEL_URI,
+        DEFAULT_GENERATE_MODEL_URI,
+        DEFAULT_RERANK_MODEL_URI,
+      ];
+      console.log(`${c.bold}Pulling models${c.reset}`);
+      const results = await pullModels(models, {
+        refresh,
+        cacheDir: DEFAULT_MODEL_CACHE_DIR,
+      });
+      for (const result of results) {
+        const size = formatBytes(result.sizeBytes);
+        const note = result.refreshed ? "refreshed" : "cached/checked";
+        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
+      }
+      break;
+    }
 
     case "search":
       if (!cli.query) {
