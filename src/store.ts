@@ -458,17 +458,46 @@ function setSQLiteFromBrewPrefixEnv(): void {
 
 setSQLiteFromBrewPrefixEnv();
 
+function createSqliteVecUnavailableError(reason: string): Error {
+  return new Error(
+    "sqlite-vec extension is unavailable. " +
+    `${reason}. ` +
+    "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
+    "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
+  );
+}
+
+function getErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+export function verifySqliteVecLoaded(db: Database): void {
+  try {
+    const row = db.prepare(`SELECT vec_version() AS version`).get() as { version?: string } | null;
+    if (!row?.version || typeof row.version !== "string") {
+      throw new Error("vec_version() returned no version");
+    }
+  } catch (err) {
+    const message = getErrorMessage(err);
+    throw createSqliteVecUnavailableError(`sqlite-vec probe failed (${message})`);
+  }
+}
+
 function initializeDatabase(db: Database): void {
   try {
     sqliteVec.load(db);
+    verifySqliteVecLoaded(db);
   } catch (err) {
-    if (err instanceof Error && err.message.includes("does not support dynamic extension loading")) {
-      throw new Error(
-        "SQLite build does not support dynamic extension loading. " +
-        "Install Homebrew SQLite so the sqlite-vec extension can be loaded, " +
-        "and set BREW_PREFIX if Homebrew is installed in a non-standard location."
-      );
+    const message = getErrorMessage(err);
+
+    if (message.includes("does not support dynamic extension loading")) {
+      throw createSqliteVecUnavailableError("SQLite build does not support dynamic extension loading");
     }
+
+    if (message.includes("sqlite-vec extension is unavailable")) {
+      throw err;
+    }
+
     throw err;
   }
   db.exec("PRAGMA journal_mode = WAL");
@@ -798,12 +827,11 @@ export function handelize(path: string): string {
     throw new Error('handelize: path cannot be empty');
   }
 
-  // Check for paths that are just extensions or only dots/special chars
-  // A valid path must have at least one letter or digit (including Unicode)
+  // Allow route-style "$" filenames while still rejecting paths with no usable content.
   const segments = path.split('/').filter(Boolean);
   const lastSegment = segments[segments.length - 1] || '';
   const filenameWithoutExt = lastSegment.replace(/\.[^.]+$/, '');
-  const hasValidContent = /[\p{L}\p{N}]/u.test(filenameWithoutExt);
+  const hasValidContent = /[\p{L}\p{N}$]/u.test(filenameWithoutExt);
   if (!hasValidContent) {
     throw new Error(`handelize: path "${path}" has no valid filename content`);
   }
@@ -822,14 +850,14 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}]+/gu, '-')  // Replace non-letter/digit chars with dash
+          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep route marker "$", dash-separate other chars
           .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
 
         return cleanedName + ext;
       } else {
         // For directories, just clean normally
         return segment
-          .replace(/[^\p{L}\p{N}]+/gu, '-')
+          .replace(/[^\p{L}\p{N}$]+/gu, '-')
           .replace(/^-+|-+$/g, '');
       }
     })
@@ -1119,6 +1147,11 @@ export function insertDocument(
   db.prepare(`
     INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
     VALUES (?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(collection, path) DO UPDATE SET
+      title = excluded.title,
+      hash = excluded.hash,
+      modified_at = excluded.modified_at,
+      active = 1
   `).run(collectionName, path, title, hash, createdAt, modifiedAt);
 }
 

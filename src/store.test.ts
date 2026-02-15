@@ -8,6 +8,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
+import * as sqliteVec from "sqlite-vec";
 import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import YAML from "yaml";
 import { disposeDefaultLlamaCpp } from "./llm.js";
 import {
   createStore,
+  verifySqliteVecLoaded,
   getDefaultDbPath,
   homedir,
   resolve,
@@ -378,6 +380,11 @@ describe("handelize", () => {
     expect(handelize("(DRAFT) Proposal v1.md")).toBe("draft-proposal-v1.md");
   });
 
+  test("handles symbol-only route filenames", () => {
+    expect(handelize("routes/api/auth/$.ts")).toBe("routes/api/auth/$.ts");
+    expect(handelize("app/routes/$id.tsx")).toBe("app/routes/$id.tsx");
+  });
+
   test("filters out empty segments", () => {
     expect(handelize("a//b/c.md")).toBe("a/b/c.md");
     expect(handelize("/a/b/")).toBe("a/b");
@@ -445,6 +452,25 @@ describe("Store Creation", () => {
     const result = store.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
     expect(result.journal_mode).toBe("wal");
     await cleanupTestDb(store);
+  });
+
+  test("verifySqliteVecLoaded throws when sqlite-vec is not loaded", () => {
+    const db = new Database(":memory:");
+    try {
+      expect(() => verifySqliteVecLoaded(db)).toThrow("sqlite-vec extension is unavailable");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("verifySqliteVecLoaded succeeds when sqlite-vec is loaded", () => {
+    const db = new Database(":memory:");
+    try {
+      sqliteVec.load(db);
+      expect(() => verifySqliteVecLoaded(db)).not.toThrow();
+    } finally {
+      db.close();
+    }
   });
 
   test("store.close closes the database connection", async () => {
@@ -2370,6 +2396,41 @@ describe("Content-Addressable Storage", () => {
     // Should have 2 entries in content table
     const contentCount = store.db.prepare(`SELECT COUNT(*) as count FROM content`).get() as { count: number };
     expect(contentCount.count).toBe(2);
+
+    await cleanupTestDb(store);
+  });
+
+  test("re-indexing a previously deactivated path reactivates instead of violating UNIQUE", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const now = new Date().toISOString();
+
+    const oldContent = "# First Version";
+    const oldHash = await hashContent(oldContent);
+    store.insertContent(oldHash, oldContent, now);
+    store.insertDocument(collectionName, "docs/foo.md", "foo", oldHash, now, now);
+
+    // Simulate file removal during update pass.
+    store.deactivateDocument(collectionName, "docs/foo.md");
+    expect(store.findActiveDocument(collectionName, "docs/foo.md")).toBeNull();
+
+    // Simulate file coming back in a later update pass.
+    const newContent = "# Second Version";
+    const newHash = await hashContent(newContent);
+    store.insertContent(newHash, newContent, now);
+
+    expect(() => {
+      store.insertDocument(collectionName, "docs/foo.md", "foo", newHash, now, now);
+    }).not.toThrow();
+
+    const rows = store.db.prepare(`
+      SELECT id, hash, active FROM documents
+      WHERE collection = ? AND path = ?
+    `).all(collectionName, "docs/foo.md") as { id: number; hash: string; active: number }[];
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.active).toBe(1);
+    expect(rows[0]!.hash).toBe(newHash);
 
     await cleanupTestDb(store);
   });
