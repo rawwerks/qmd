@@ -11,10 +11,11 @@
  *   const store = createStore();
  */
 
-import { Database } from "bun:sqlite";
-import { Glob } from "bun";
-import { realpathSync, statSync } from "node:fs";
-import * as sqliteVec from "sqlite-vec";
+import { openDatabase, loadSqliteVec } from "./db.js";
+import type { Database } from "./db.js";
+import picomatch from "picomatch";
+import { createHash } from "crypto";
+import { realpathSync, statSync, mkdirSync } from "node:fs";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -22,7 +23,7 @@ import {
   formatDocForEmbedding,
   type RerankDocument,
   type ILLMSession,
-} from "./llm";
+} from "./llm.js";
 import {
   findContextForPath as collectionsFindContextForPath,
   addContext as collectionsAddContext,
@@ -36,25 +37,186 @@ import {
   setGlobalContext,
   loadConfig as collectionsLoadConfig,
   type NamedCollection,
-} from "./collections";
+} from "./collections.js";
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-const HOME = Bun.env.HOME || "/tmp";
+const HOME = process.env.HOME || "/tmp";
 export const DEFAULT_EMBED_MODEL = "embeddinggemma";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 
-// Chunking: 800 tokens per chunk with 15% overlap
-export const CHUNK_SIZE_TOKENS = 800;
-export const CHUNK_OVERLAP_TOKENS = Math.floor(CHUNK_SIZE_TOKENS * 0.15);  // 120 tokens (15% overlap)
+// Chunking: 900 tokens per chunk with 15% overlap
+// Increased from 800 to accommodate smart chunking finding natural break points
+export const CHUNK_SIZE_TOKENS = 900;
+export const CHUNK_OVERLAP_TOKENS = Math.floor(CHUNK_SIZE_TOKENS * 0.15);  // 135 tokens (15% overlap)
 // Fallback char-based approximation for sync chunking (~4 chars per token)
-export const CHUNK_SIZE_CHARS = CHUNK_SIZE_TOKENS * 4;  // 3200 chars
-export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 480 chars
+export const CHUNK_SIZE_CHARS = CHUNK_SIZE_TOKENS * 4;  // 3600 chars
+export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
+// Search window for finding optimal break points (in tokens, ~200 tokens)
+export const CHUNK_WINDOW_TOKENS = 200;
+export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
+
+// =============================================================================
+// Smart Chunking - Break Point Detection
+// =============================================================================
+
+/**
+ * A potential break point in the document with a base score indicating quality.
+ */
+export interface BreakPoint {
+  pos: number;    // character position
+  score: number;  // base score (higher = better break point)
+  type: string;   // for debugging: 'h1', 'h2', 'blank', etc.
+}
+
+/**
+ * A region where a code fence exists (between ``` markers).
+ * We should never split inside a code fence.
+ */
+export interface CodeFenceRegion {
+  start: number;  // position of opening ```
+  end: number;    // position of closing ``` (or document end if unclosed)
+}
+
+/**
+ * Patterns for detecting break points in markdown documents.
+ * Higher scores indicate better places to split.
+ * Scores are spread wide so headings decisively beat lower-quality breaks.
+ * Order matters for scoring - more specific patterns first.
+ */
+export const BREAK_PATTERNS: [RegExp, number, string][] = [
+  [/\n#{1}(?!#)/g, 100, 'h1'],     // # but not ##
+  [/\n#{2}(?!#)/g, 90, 'h2'],      // ## but not ###
+  [/\n#{3}(?!#)/g, 80, 'h3'],      // ### but not ####
+  [/\n#{4}(?!#)/g, 70, 'h4'],      // #### but not #####
+  [/\n#{5}(?!#)/g, 60, 'h5'],      // ##### but not ######
+  [/\n#{6}(?!#)/g, 50, 'h6'],      // ######
+  [/\n```/g, 80, 'codeblock'],     // code block boundary (same as h3)
+  [/\n(?:---|\*\*\*|___)\s*\n/g, 60, 'hr'],  // horizontal rule
+  [/\n\n+/g, 20, 'blank'],         // paragraph boundary
+  [/\n[-*]\s/g, 5, 'list'],        // unordered list item
+  [/\n\d+\.\s/g, 5, 'numlist'],    // ordered list item
+  [/\n/g, 1, 'newline'],           // minimal break
+];
+
+/**
+ * Scan text for all potential break points.
+ * Returns sorted array of break points with higher-scoring patterns taking precedence
+ * when multiple patterns match the same position.
+ */
+export function scanBreakPoints(text: string): BreakPoint[] {
+  const points: BreakPoint[] = [];
+  const seen = new Map<number, BreakPoint>();  // pos -> best break point at that pos
+
+  for (const [pattern, score, type] of BREAK_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      const pos = match.index!;
+      const existing = seen.get(pos);
+      // Keep higher score if position already seen
+      if (!existing || score > existing.score) {
+        const bp = { pos, score, type };
+        seen.set(pos, bp);
+      }
+    }
+  }
+
+  // Convert to array and sort by position
+  for (const bp of seen.values()) {
+    points.push(bp);
+  }
+  return points.sort((a, b) => a.pos - b.pos);
+}
+
+/**
+ * Find all code fence regions in the text.
+ * Code fences are delimited by ``` and we should never split inside them.
+ */
+export function findCodeFences(text: string): CodeFenceRegion[] {
+  const regions: CodeFenceRegion[] = [];
+  const fencePattern = /\n```/g;
+  let inFence = false;
+  let fenceStart = 0;
+
+  for (const match of text.matchAll(fencePattern)) {
+    if (!inFence) {
+      fenceStart = match.index!;
+      inFence = true;
+    } else {
+      regions.push({ start: fenceStart, end: match.index! + match[0].length });
+      inFence = false;
+    }
+  }
+
+  // Handle unclosed fence - extends to end of document
+  if (inFence) {
+    regions.push({ start: fenceStart, end: text.length });
+  }
+
+  return regions;
+}
+
+/**
+ * Check if a position is inside a code fence region.
+ */
+export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boolean {
+  return fences.some(f => pos > f.start && pos < f.end);
+}
+
+/**
+ * Find the best cut position using scored break points with distance decay.
+ *
+ * Uses squared distance for gentler early decay - headings far back still win
+ * over low-quality breaks near the target.
+ *
+ * @param breakPoints - Pre-scanned break points from scanBreakPoints()
+ * @param targetCharPos - The ideal cut position (e.g., maxChars boundary)
+ * @param windowChars - How far back to search for break points (default ~200 tokens)
+ * @param decayFactor - How much to penalize distance (0.7 = 30% score at window edge)
+ * @param codeFences - Code fence regions to avoid splitting inside
+ * @returns The best position to cut at
+ */
+export function findBestCutoff(
+  breakPoints: BreakPoint[],
+  targetCharPos: number,
+  windowChars: number = CHUNK_WINDOW_CHARS,
+  decayFactor: number = 0.7,
+  codeFences: CodeFenceRegion[] = []
+): number {
+  const windowStart = targetCharPos - windowChars;
+  let bestScore = -1;
+  let bestPos = targetCharPos;
+
+  for (const bp of breakPoints) {
+    if (bp.pos < windowStart) continue;
+    if (bp.pos > targetCharPos) break;  // sorted, so we can stop
+
+    // Skip break points inside code fences
+    if (isInsideCodeFence(bp.pos, codeFences)) continue;
+
+    const distance = targetCharPos - bp.pos;
+    // Squared distance decay: gentle early, steep late
+    // At target: multiplier = 1.0
+    // At 25% back: multiplier = 0.956
+    // At 50% back: multiplier = 0.825
+    // At 75% back: multiplier = 0.606
+    // At window edge: multiplier = 0.3
+    const normalizedDist = distance / windowChars;
+    const multiplier = 1.0 - (normalizedDist * normalizedDist) * decayFactor;
+    const finalScore = bp.score * multiplier;
+
+    if (finalScore > bestScore) {
+      bestScore = finalScore;
+      bestPos = bp.pos;
+    }
+  }
+
+  return bestPos;
+}
 
 // Hybrid query: strong BM25 signal detection thresholds
 // Skip expensive LLM expansion when top result is strong AND clearly separated from runner-up
@@ -190,7 +352,7 @@ export function resolve(...paths: string[]): string {
     }
   } else {
     // Start with PWD or cwd, then append the first relative path
-    const pwd = normalizePathSeparators(Bun.env.PWD || process.cwd());
+    const pwd = normalizePathSeparators(process.env.PWD || process.cwd());
     
     // Extract Windows drive from PWD if present
     if (pwd.length >= 2 && /[a-zA-Z]/.test(pwd[0]!) && pwd[1] === ':') {
@@ -261,8 +423,8 @@ export function enableProductionMode(): void {
 
 export function getDefaultDbPath(indexName: string = "index"): string {
   // Always allow override via INDEX_PATH (for testing)
-  if (Bun.env.INDEX_PATH) {
-    return Bun.env.INDEX_PATH;
+  if (process.env.INDEX_PATH) {
+    return process.env.INDEX_PATH;
   }
 
   // In non-production mode (tests), require explicit path
@@ -273,9 +435,9 @@ export function getDefaultDbPath(indexName: string = "index"): string {
     );
   }
 
-  const cacheDir = Bun.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
+  const cacheDir = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
   const qmdCacheDir = resolve(cacheDir, "qmd");
-  try { Bun.spawnSync(["mkdir", "-p", qmdCacheDir]); } catch { }
+  try { mkdirSync(qmdCacheDir, { recursive: true }); } catch { }
   return resolve(qmdCacheDir, `${indexName}.sqlite`);
 }
 
@@ -430,33 +592,6 @@ export function toVirtualPath(db: Database, absolutePath: string): string | null
 // Database initialization
 // =============================================================================
 
-function setSQLiteFromBrewPrefixEnv(): void {
-  const candidates: string[] = [];
-
-  if (process.platform === "darwin") {
-    // Use BREW_PREFIX for non-standard Homebrew installs (common on corporate Macs).
-    const brewPrefix = Bun.env.BREW_PREFIX || Bun.env.HOMEBREW_PREFIX;
-    if (brewPrefix) {
-      // Homebrew can place SQLite in opt/sqlite (keg-only) or directly under the prefix.
-      candidates.push(`${brewPrefix}/opt/sqlite/lib/libsqlite3.dylib`);
-      candidates.push(`${brewPrefix}/lib/libsqlite3.dylib`);
-    } else {
-      candidates.push("/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib");
-      candidates.push("/usr/local/opt/sqlite/lib/libsqlite3.dylib");
-    }
-  }
-
-  for (const candidate of candidates) {
-    try {
-      if (statSync(candidate).size > 0) {
-        Database.setCustomSQLite(candidate);
-        return;
-      }
-    } catch { }
-  }
-}
-
-setSQLiteFromBrewPrefixEnv();
 
 function createSqliteVecUnavailableError(reason: string): Error {
   return new Error(
@@ -483,22 +618,16 @@ export function verifySqliteVecLoaded(db: Database): void {
   }
 }
 
+let _sqliteVecAvailable: boolean | null = null;
+
 function initializeDatabase(db: Database): void {
   try {
-    sqliteVec.load(db);
+    loadSqliteVec(db);
     verifySqliteVecLoaded(db);
-  } catch (err) {
-    const message = getErrorMessage(err);
-
-    if (message.includes("does not support dynamic extension loading")) {
-      throw createSqliteVecUnavailableError("SQLite build does not support dynamic extension loading");
-    }
-
-    if (message.includes("sqlite-vec extension is unavailable")) {
-      throw err;
-    }
-
-    throw err;
+    _sqliteVecAvailable = true;
+  } catch {
+    // sqlite-vec is optional — vector search won't work but FTS is fine
+    _sqliteVecAvailable = false;
   }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
@@ -612,7 +741,14 @@ function initializeDatabase(db: Database): void {
 }
 
 
+export function isSqliteVecAvailable(): boolean {
+  return _sqliteVecAvailable === true;
+}
+
 function ensureVecTableInternal(db: Database, dimensions: number): void {
+  if (!_sqliteVecAvailable) {
+    throw new Error("sqlite-vec is not available. Vector operations require a SQLite build with extension loading support.");
+  }
   const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
   if (tableInfo) {
     const match = tableInfo.sql.match(/float\[(\d+)\]/);
@@ -669,8 +805,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -710,7 +846,7 @@ export type Store = {
  */
 export function createStore(dbPath?: string): Store {
   const resolvedPath = dbPath || getDefaultDbPath();
-  const db = new Database(resolvedPath);
+  const db = openDatabase(resolvedPath);
   initializeDatabase(db);
 
   return {
@@ -752,8 +888,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
+    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -966,7 +1102,7 @@ export function getIndexHealth(db: Database): IndexHealthInfo {
 // =============================================================================
 
 export function getCacheKey(url: string, body: object): string {
-  const hash = new Bun.CryptoHasher("sha256");
+  const hash = createHash("sha256");
   hash.update(url);
   hash.update(JSON.stringify(body));
   return hash.digest("hex");
@@ -1082,7 +1218,7 @@ export function vacuumDatabase(db: Database): void {
 // =============================================================================
 
 export async function hashContent(content: string): Promise<string> {
-  const hash = new Bun.CryptoHasher("sha256");
+  const hash = createHash("sha256");
   hash.update(content);
   return hash.digest("hex");
 }
@@ -1163,10 +1299,11 @@ export function findActiveDocument(
   collectionName: string,
   path: string
 ): { id: number; hash: string; title: string } | null {
-  return db.prepare(`
+  const row = db.prepare(`
     SELECT id, hash, title FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | null;
+  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  return row ?? null;
 }
 
 /**
@@ -1217,57 +1354,43 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
-export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHARS, overlapChars: number = CHUNK_OVERLAP_CHARS): { text: string; pos: number }[] {
+export function chunkDocument(
+  content: string,
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+  windowChars: number = CHUNK_WINDOW_CHARS
+): { text: string; pos: number }[] {
   if (content.length <= maxChars) {
     return [{ text: content, pos: 0 }];
   }
+
+  // Pre-scan all break points and code fences once
+  const breakPoints = scanBreakPoints(content);
+  const codeFences = findCodeFences(content);
 
   const chunks: { text: string; pos: number }[] = [];
   let charPos = 0;
 
   while (charPos < content.length) {
-    // Calculate end position for this chunk
-    let endPos = Math.min(charPos + maxChars, content.length);
+    // Calculate target end position for this chunk
+    const targetEndPos = Math.min(charPos + maxChars, content.length);
 
-    // If not at the end, try to find a good break point
+    let endPos = targetEndPos;
+
+    // If not at the end, find the best break point
     if (endPos < content.length) {
-      const slice = content.slice(charPos, endPos);
+      // Find best cutoff using scored algorithm
+      const bestCutoff = findBestCutoff(
+        breakPoints,
+        targetEndPos,
+        windowChars,
+        0.7,
+        codeFences
+      );
 
-      // Look for break points in the last 30% of the chunk
-      const searchStart = Math.floor(slice.length * 0.7);
-      const searchSlice = slice.slice(searchStart);
-
-      // Priority: paragraph > sentence > line > word
-      let breakOffset = -1;
-      const paragraphBreak = searchSlice.lastIndexOf('\n\n');
-      if (paragraphBreak >= 0) {
-        breakOffset = searchStart + paragraphBreak + 2;
-      } else {
-        const sentenceEnd = Math.max(
-          searchSlice.lastIndexOf('. '),
-          searchSlice.lastIndexOf('.\n'),
-          searchSlice.lastIndexOf('? '),
-          searchSlice.lastIndexOf('?\n'),
-          searchSlice.lastIndexOf('! '),
-          searchSlice.lastIndexOf('!\n')
-        );
-        if (sentenceEnd >= 0) {
-          breakOffset = searchStart + sentenceEnd + 2;
-        } else {
-          const lineBreak = searchSlice.lastIndexOf('\n');
-          if (lineBreak >= 0) {
-            breakOffset = searchStart + lineBreak + 1;
-          } else {
-            const spaceBreak = searchSlice.lastIndexOf(' ');
-            if (spaceBreak >= 0) {
-              breakOffset = searchStart + spaceBreak + 1;
-            }
-          }
-        }
-      }
-
-      if (breakOffset > 0) {
-        endPos = charPos + breakOffset;
+      // Only use the cutoff if it's within our current chunk
+      if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
+        endPos = bestCutoff;
       }
     }
 
@@ -1301,73 +1424,49 @@ export function chunkDocument(content: string, maxChars: number = CHUNK_SIZE_CHA
 export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
-  overlapTokens: number = CHUNK_OVERLAP_TOKENS
+  overlapTokens: number = CHUNK_OVERLAP_TOKENS,
+  windowTokens: number = CHUNK_WINDOW_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
 
-  // Tokenize once upfront
-  const allTokens = await llm.tokenize(content);
-  const totalTokens = allTokens.length;
+  // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
+  // If chunks exceed limit, they'll be re-split with actual ratio
+  const avgCharsPerToken = 3;
+  const maxChars = maxTokens * avgCharsPerToken;
+  const overlapChars = overlapTokens * avgCharsPerToken;
+  const windowChars = windowTokens * avgCharsPerToken;
 
-  if (totalTokens <= maxTokens) {
-    return [{ text: content, pos: 0, tokens: totalTokens }];
-  }
+  // Chunk in character space with conservative estimate
+  let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
 
-  const chunks: { text: string; pos: number; tokens: number }[] = [];
-  const step = maxTokens - overlapTokens;
-  const avgCharsPerToken = content.length / totalTokens;
-  let tokenPos = 0;
+  // Tokenize and split any chunks that still exceed limit
+  const results: { text: string; pos: number; tokens: number }[] = [];
 
-  while (tokenPos < totalTokens) {
-    const chunkEnd = Math.min(tokenPos + maxTokens, totalTokens);
-    const chunkTokens = allTokens.slice(tokenPos, chunkEnd);
-    let chunkText = await llm.detokenize(chunkTokens);
+  for (const chunk of charChunks) {
+    const tokens = await llm.tokenize(chunk.text);
 
-    // Find a good break point if not at end of document
-    if (chunkEnd < totalTokens) {
-      const searchStart = Math.floor(chunkText.length * 0.7);
-      const searchSlice = chunkText.slice(searchStart);
+    if (tokens.length <= maxTokens) {
+      results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
+    } else {
+      // Chunk is still too large - split it further
+      // Use actual token count to estimate better char limit
+      const actualCharsPerToken = chunk.text.length / tokens.length;
+      const safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95); // 5% safety margin
 
-      let breakOffset = -1;
-      const paragraphBreak = searchSlice.lastIndexOf('\n\n');
-      if (paragraphBreak >= 0) {
-        breakOffset = paragraphBreak + 2;
-      } else {
-        const sentenceEnd = Math.max(
-          searchSlice.lastIndexOf('. '),
-          searchSlice.lastIndexOf('.\n'),
-          searchSlice.lastIndexOf('? '),
-          searchSlice.lastIndexOf('?\n'),
-          searchSlice.lastIndexOf('! '),
-          searchSlice.lastIndexOf('!\n')
-        );
-        if (sentenceEnd >= 0) {
-          breakOffset = sentenceEnd + 2;
-        } else {
-          const lineBreak = searchSlice.lastIndexOf('\n');
-          if (lineBreak >= 0) {
-            breakOffset = lineBreak + 1;
-          }
-        }
-      }
+      const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
 
-      if (breakOffset >= 0) {
-        chunkText = chunkText.slice(0, searchStart + breakOffset);
+      for (const subChunk of subChunks) {
+        const subTokens = await llm.tokenize(subChunk.text);
+        results.push({
+          text: subChunk.text,
+          pos: chunk.pos + subChunk.pos,
+          tokens: subTokens.length,
+        });
       }
     }
-
-    // Approximate character position based on token position
-    const charPos = Math.floor(tokenPos * avgCharsPerToken);
-    chunks.push({ text: chunkText, pos: charPos, tokens: chunkTokens.length });
-
-    // Move forward
-    if (chunkEnd >= totalTokens) break;
-
-    // Advance by step tokens (maxTokens - overlap)
-    tokenPos += step;
   }
 
-  return chunks;
+  return results;
 }
 
 // =============================================================================
@@ -1477,9 +1576,9 @@ export function matchFilesByGlob(db: Database, pattern: string): { filepath: str
     WHERE d.active = 1
   `).all() as { virtual_path: string; body_length: number; path: string; collection: string }[];
 
-  const glob = new Glob(pattern);
+  const isMatch = picomatch(pattern);
   return allFiles
-    .filter(f => glob.match(f.virtual_path) || glob.match(f.path))
+    .filter(f => isMatch(f.virtual_path) || isMatch(f.path))
     .map(f => ({
       filepath: f.virtual_path,  // Virtual path for precise lookup
       displayPath: f.path,        // Relative path for display
@@ -1888,16 +1987,113 @@ function sanitizeFTS5Term(term: string): string {
   return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
 }
 
+/**
+ * Parse lex query syntax into FTS5 query.
+ *
+ * Supports:
+ * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
+ * - Negation: -term or -"phrase" → uses FTS5 NOT operator
+ * - Plain terms: term → "term"* (prefix match)
+ *
+ * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
+ * So `-term` only works when there are also positive terms.
+ *
+ * Examples:
+ *   performance -sports     → "performance"* NOT "sports"*
+ *   "machine learning"      → "machine learning"
+ */
 function buildFTS5Query(query: string): string | null {
-  const terms = query.split(/\s+/)
-    .map(t => sanitizeFTS5Term(t))
-    .filter(t => t.length > 0);
-  if (terms.length === 0) return null;
-  if (terms.length === 1) return `"${terms[0]}"*`;
-  return terms.map(t => `"${t}"*`).join(' AND ');
+  const positive: string[] = [];
+  const negative: string[] = [];
+
+  let i = 0;
+  const s = query.trim();
+
+  while (i < s.length) {
+    // Skip whitespace
+    while (i < s.length && /\s/.test(s[i]!)) i++;
+    if (i >= s.length) break;
+
+    // Check for negation prefix
+    const negated = s[i] === '-';
+    if (negated) i++;
+
+    // Check for quoted phrase
+    if (s[i] === '"') {
+      const start = i + 1;
+      i++;
+      while (i < s.length && s[i] !== '"') i++;
+      const phrase = s.slice(start, i).trim();
+      i++; // skip closing quote
+      if (phrase.length > 0) {
+        const sanitized = phrase.split(/\s+/).map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+        if (sanitized) {
+          const ftsPhrase = `"${sanitized}"`;  // Exact phrase, no prefix match
+          if (negated) {
+            negative.push(ftsPhrase);
+          } else {
+            positive.push(ftsPhrase);
+          }
+        }
+      }
+    } else {
+      // Plain term (until whitespace or quote)
+      const start = i;
+      while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
+      const term = s.slice(start, i);
+
+      const sanitized = sanitizeFTS5Term(term);
+      if (sanitized) {
+        const ftsTerm = `"${sanitized}"*`;  // Prefix match
+        if (negated) {
+          negative.push(ftsTerm);
+        } else {
+          positive.push(ftsTerm);
+        }
+      }
+    }
+  }
+
+  if (positive.length === 0 && negative.length === 0) return null;
+
+  // If only negative terms, we can't search (FTS5 NOT is binary)
+  if (positive.length === 0) return null;
+
+  // Join positive terms with AND
+  let result = positive.join(' AND ');
+
+  // Add NOT clause for negative terms
+  for (const neg of negative) {
+    result = `${result} NOT ${neg}`;
+  }
+
+  return result;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionId?: number, pathFilter?: string): SearchResult[] {
+/**
+ * Validate that a vec/hyde query doesn't use lex-only syntax.
+ * Returns error message if invalid, null if valid.
+ */
+export function validateSemanticQuery(query: string): string | null {
+  // Check for negation syntax
+  if (/-\w/.test(query) || /-"/.test(query)) {
+    return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
+  }
+  return null;
+}
+
+export function validateLexQuery(query: string): string | null {
+  if (/[\r\n]/.test(query)) {
+    return 'Lex queries must be a single line. Remove newline characters or split into separate lex: lines.';
+  }
+  const quoteCount = (query.match(/"/g) ?? []).length;
+  if (quoteCount % 2 === 1) {
+    return 'Lex query has an unmatched double quote ("). Add the closing quote or remove it.';
+  }
+  return null;
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -1916,18 +2112,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   `;
   const params: (string | number)[] = [ftsQuery];
 
-  if (collectionId) {
-    // Note: collectionId is a legacy parameter that should be phased out
-    // Collections are now managed in YAML. For now, we interpret it as a collection name filter.
-    // This code path is likely unused as collection filtering should be done at CLI level.
+  if (collectionName) {
     sql += ` AND d.collection = ?`;
-    params.push(String(collectionId));
-  }
-
-  if (pathFilter) {
-    // Filter by path prefix (e.g., "journals/" matches "journals/2024-01-01.md")
-    sql += ` AND d.path LIKE ?`;
-    params.push(`${pathFilter}%`);
+    params.push(String(collectionName));
   }
 
   // bm25 lower is better; sort ascending.
@@ -1963,11 +2150,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, model, true, session);
+  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -2579,14 +2766,17 @@ export type SnippetResult = {
   snippetLines: number;   // Number of lines in snippet
 };
 
-export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number): SnippetResult {
+export function extractSnippet(body: string, query: string, maxLen = 500, chunkPos?: number, chunkLen?: number): SnippetResult {
   const totalLines = body.split('\n').length;
   let searchBody = body;
   let lineOffset = 0;
 
   if (chunkPos && chunkPos > 0) {
+    // Search within the chunk region, with some padding for context
+    // Use provided chunkLen or fall back to max chunk size (covers variable-length chunks)
+    const searchLen = chunkLen || CHUNK_SIZE_CHARS;
     const contextStart = Math.max(0, chunkPos - 100);
-    const contextEnd = Math.min(body.length, chunkPos + maxLen + 100);
+    const contextEnd = Math.min(body.length, chunkPos + searchLen + 100);
     searchBody = body.slice(contextStart, contextEnd);
     if (contextStart > 0) {
       lineOffset = body.slice(0, contextStart).split('\n').length - 1;
@@ -2669,12 +2859,18 @@ export function addLineNumbers(text: string, startLine: number = 1): string {
 export interface SearchHooks {
   /** BM25 probe found strong signal — expansion will be skipped */
   onStrongSignal?: (topScore: number) => void;
-  /** Query expansion complete. Empty array = strong signal skip (no expansion). */
-  onExpand?: (original: string, expanded: ExpandedQuery[]) => void;
+  /** Query expansion starting */
+  onExpandStart?: () => void;
+  /** Query expansion complete. Empty array = strong signal skip. elapsedMs = time taken. */
+  onExpand?: (original: string, expanded: ExpandedQuery[], elapsedMs: number) => void;
+  /** Embedding starting (vec/hyde queries) */
+  onEmbedStart?: (count: number) => void;
+  /** Embedding complete */
+  onEmbedDone?: (elapsedMs: number) => void;
   /** Reranking is about to start */
   onRerankStart?: (chunkCount: number) => void;
   /** Reranking finished */
-  onRerankDone?: () => void;
+  onRerankDone?: (elapsedMs: number) => void;
 }
 
 export interface HybridQueryOptions {
@@ -2728,8 +2924,8 @@ export async function hybridQuery(
   ).get();
 
   // Step 1: BM25 probe — strong signal skips expensive LLM expansion
-  const initialFts = store.searchFTS(query, 20)
-    .filter(r => !collection || r.collectionName === collection);
+  // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
+  const initialFts = store.searchFTS(query, 20, collection);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = initialFts.length > 0
@@ -2739,11 +2935,13 @@ export async function hybridQuery(
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
 
   // Step 2: Expand query (or skip if strong signal)
+  hooks?.onExpandStart?.();
+  const expandStart = Date.now();
   const expanded = hasStrongSignal
     ? []
     : await store.expandQuery(query);
 
-  hooks?.onExpand?.(query, expanded);
+  hooks?.onExpand?.(query, expanded, Date.now() - expandStart);
 
   // Seed with initial FTS results (avoid re-running original query FTS)
   if (initialFts.length > 0) {
@@ -2755,26 +2953,15 @@ export async function hybridQuery(
   }
 
   // Step 3: Route searches by query type
-  // Original query → vector search (FTS already covered by probe in step 1).
-  // Vector searches run sequentially — node-llama-cpp's embed context
-  // hangs on concurrent embed() calls (known limitation).
-  if (hasVectors) {
-    const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20, collection);
-    if (vecResults.length > 0) {
-      for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-      rankedLists.push(vecResults.map(r => ({
-        file: r.filepath, displayPath: r.displayPath,
-        title: r.title, body: r.body || "", score: r.score,
-      })));
-    }
-  }
+  //
+  // Strategy: run all FTS queries immediately (they're sync/instant), then
+  // batch-embed all vector queries in one embedBatch() call, then run
+  // sqlite-vec lookups with pre-computed embeddings.
 
-  // Expanded queries → route by type: lex→FTS only, vec/hyde→vector only.
-  // This restores the CLI's query-type-aware routing that was lost in the initial refactor.
+  // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.text, 20)
-        .filter(r => !collection || r.collectionName === collection);
+      const ftsResults = store.searchFTS(q.text, 20, collection);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -2782,17 +2969,43 @@ export async function hybridQuery(
           title: r.title, body: r.body || "", score: r.score,
         })));
       }
-    } else {
-      // vec or hyde → vector search only
-      if (hasVectors) {
-        const vecResults = await store.searchVec(q.text, DEFAULT_EMBED_MODEL, 20, collection);
-        if (vecResults.length > 0) {
-          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(vecResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
-          })));
-        }
+    }
+  }
+
+  // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
+  if (hasVectors) {
+    const vecQueries: { text: string; isOriginal: boolean }[] = [
+      { text: query, isOriginal: true },
+    ];
+    for (const q of expanded) {
+      if (q.type === 'vec' || q.type === 'hyde') {
+        vecQueries.push({ text: q.text, isOriginal: false });
+      }
+    }
+
+    // Batch embed all vector queries in a single call
+    const llm = getDefaultLlamaCpp();
+    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    hooks?.onEmbedStart?.(textsToEmbed.length);
+    const embedStart = Date.now();
+    const embeddings = await llm.embedBatch(textsToEmbed);
+    hooks?.onEmbedDone?.(Date.now() - embedStart);
+
+    // Run sqlite-vec lookups with pre-computed embeddings
+    for (let i = 0; i < vecQueries.length; i++) {
+      const embedding = embeddings[i]?.embedding;
+      if (!embedding) continue;
+
+      const vecResults = await store.searchVec(
+        vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
+        undefined, embedding
+      );
+      if (vecResults.length > 0) {
+        for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+        rankedLists.push(vecResults.map(r => ({
+          file: r.filepath, displayPath: r.displayPath,
+          title: r.title, body: r.body || "", score: r.score,
+        })));
       }
     }
   }
@@ -2829,8 +3042,9 @@ export async function hybridQuery(
 
   // Step 6: Rerank chunks (NOT full bodies)
   hooks?.onRerankStart?.(chunksToRerank.length);
+  const rerankStart = Date.now();
   const reranked = await store.rerank(query, chunksToRerank);
-  hooks?.onRerankDone?.();
+  hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
@@ -2920,9 +3134,10 @@ export async function vectorSearchQuery(
   if (!hasVectors) return [];
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
+  const expandStart = Date.now();
   const allExpanded = await store.expandQuery(query);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
-  options?.hooks?.onExpand?.(query, vecExpanded);
+  options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
@@ -2947,6 +3162,230 @@ export async function vectorSearchQuery(
 
   return Array.from(allResults.values())
     .sort((a, b) => b.score - a.score)
+    .filter(r => r.score >= minScore)
+    .slice(0, limit);
+}
+
+// =============================================================================
+// Structured search — pre-expanded queries from LLM
+// =============================================================================
+
+/**
+ * A single sub-search in a structured search request.
+ * Matches the format used in QMD training data.
+ */
+export interface StructuredSubSearch {
+  /** Search type: 'lex' for BM25, 'vec' for semantic, 'hyde' for hypothetical */
+  type: 'lex' | 'vec' | 'hyde';
+  /** The search query text */
+  query: string;
+  /** Optional line number for error reporting (CLI parser) */
+  line?: number;
+}
+
+export interface StructuredSearchOptions {
+  collections?: string[];   // Filter to specific collections (OR match)
+  limit?: number;           // default 10
+  minScore?: number;        // default 0
+  candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
+  /** Future: domain intent hint for routing/boosting */
+  intent?: string;
+  hooks?: SearchHooks;
+}
+
+/**
+ * Structured search: execute pre-expanded queries without LLM query expansion.
+ *
+ * Designed for LLM callers (MCP/HTTP) that generate their own query expansions.
+ * Skips the internal expandQuery() step — goes directly to:
+ *
+ * Pipeline:
+ * 1. Route searches: lex→FTS, vec/hyde→vector (batch embed)
+ * 2. RRF fusion across all result lists
+ * 3. Chunk documents + keyword-best-chunk selection
+ * 4. Rerank on chunks
+ * 5. Position-aware score blending
+ * 6. Dedup, filter, slice
+ *
+ * This is the recommended endpoint for capable LLMs — they can generate
+ * better query variations than our small local model, especially for
+ * domain-specific or nuanced queries.
+ */
+export async function structuredSearch(
+  store: Store,
+  searches: StructuredSubSearch[],
+  options?: StructuredSearchOptions
+): Promise<HybridQueryResult[]> {
+  const limit = options?.limit ?? 10;
+  const minScore = options?.minScore ?? 0;
+  const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
+  const hooks = options?.hooks;
+
+  const collections = options?.collections;
+
+  if (searches.length === 0) return [];
+
+  // Validate queries before executing
+  for (const search of searches) {
+    const location = search.line ? `Line ${search.line}` : 'Structured search';
+    if (/[\r\n]/.test(search.query)) {
+      throw new Error(`${location} (${search.type}): queries must be single-line. Remove newline characters.`);
+    }
+    if (search.type === 'lex') {
+      const error = validateLexQuery(search.query);
+      if (error) {
+        throw new Error(`${location} (lex): ${error}`);
+      }
+    } else if (search.type === 'vec' || search.type === 'hyde') {
+      const error = validateSemanticQuery(search.query);
+      if (error) {
+        throw new Error(`${location} (${search.type}): ${error}`);
+      }
+    }
+  }
+
+  const rankedLists: RankedResult[][] = [];
+  const docidMap = new Map<string, string>(); // filepath -> docid
+  const hasVectors = !!store.db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+  ).get();
+
+  // Helper to run search across collections (or all if undefined)
+  const collectionList = collections ?? [undefined]; // undefined = all collections
+
+  // Step 1: Run FTS for all lex searches (sync, instant)
+  for (const search of searches) {
+    if (search.type === 'lex') {
+      for (const coll of collectionList) {
+        const ftsResults = store.searchFTS(search.query, 20, coll);
+        if (ftsResults.length > 0) {
+          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(ftsResults.map(r => ({
+            file: r.filepath, displayPath: r.displayPath,
+            title: r.title, body: r.body || "", score: r.score,
+          })));
+        }
+      }
+    }
+  }
+
+  // Step 2: Batch embed and run vector searches for vec/hyde
+  if (hasVectors) {
+    const vecSearches = searches.filter(s => s.type === 'vec' || s.type === 'hyde');
+    if (vecSearches.length > 0) {
+      const llm = getDefaultLlamaCpp();
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      hooks?.onEmbedStart?.(textsToEmbed.length);
+      const embedStart = Date.now();
+      const embeddings = await llm.embedBatch(textsToEmbed);
+      hooks?.onEmbedDone?.(Date.now() - embedStart);
+
+      for (let i = 0; i < vecSearches.length; i++) {
+        const embedding = embeddings[i]?.embedding;
+        if (!embedding) continue;
+
+        for (const coll of collectionList) {
+          const vecResults = await store.searchVec(
+            vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
+            undefined, embedding
+          );
+          if (vecResults.length > 0) {
+            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(vecResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+          }
+        }
+      }
+    }
+  }
+
+  if (rankedLists.length === 0) return [];
+
+  // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
+  const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
+  const fused = reciprocalRankFusion(rankedLists, weights);
+  const candidates = fused.slice(0, candidateLimit);
+
+  if (candidates.length === 0) return [];
+
+  hooks?.onExpand?.("", [], 0); // Signal no expansion (pre-expanded)
+
+  // Step 4: Chunk documents, pick best chunk per doc for reranking
+  // Use first lex query as the "query" for keyword matching, or first vec if no lex
+  const primaryQuery = searches.find(s => s.type === 'lex')?.query
+    || searches.find(s => s.type === 'vec')?.query
+    || searches[0]?.query || "";
+  const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const chunksToRerank: { file: string; text: string }[] = [];
+  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+
+  for (const cand of candidates) {
+    const chunks = chunkDocument(cand.body);
+    if (chunks.length === 0) continue;
+
+    // Pick chunk with most keyword overlap
+    let bestIdx = 0;
+    let bestScore = -1;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkLower = chunks[i]!.text.toLowerCase();
+      const score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      if (score > bestScore) { bestScore = score; bestIdx = i; }
+    }
+
+    chunksToRerank.push({ file: cand.file, text: chunks[bestIdx]!.text });
+    docChunkMap.set(cand.file, { chunks, bestIdx });
+  }
+
+  // Step 5: Rerank chunks
+  hooks?.onRerankStart?.(chunksToRerank.length);
+  const rerankStart2 = Date.now();
+  const reranked = await store.rerank(primaryQuery, chunksToRerank);
+  hooks?.onRerankDone?.(Date.now() - rerankStart2);
+
+  // Step 6: Blend RRF position score with reranker score
+  const candidateMap = new Map(candidates.map(c => [c.file, {
+    displayPath: c.displayPath, title: c.title, body: c.body,
+  }]));
+  const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
+
+  const blended = reranked.map(r => {
+    const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
+    let rrfWeight: number;
+    if (rrfRank <= 3) rrfWeight = 0.75;
+    else if (rrfRank <= 10) rrfWeight = 0.60;
+    else rrfWeight = 0.40;
+    const rrfScore = 1 / rrfRank;
+    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+
+    const candidate = candidateMap.get(r.file);
+    const chunkInfo = docChunkMap.get(r.file);
+    const bestIdx = chunkInfo?.bestIdx ?? 0;
+    const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
+    const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+
+    return {
+      file: r.file,
+      displayPath: candidate?.displayPath || "",
+      title: candidate?.title || "",
+      body: candidate?.body || "",
+      bestChunk,
+      bestChunkPos,
+      score: blendedScore,
+      context: store.getContextForFile(r.file),
+      docid: docidMap.get(r.file) || "",
+    };
+  }).sort((a, b) => b.score - a.score);
+
+  // Step 7: Dedup by file
+  const seenFiles = new Set<string>();
+  return blended
+    .filter(r => {
+      if (seenFiles.has(r.file)) return false;
+      seenFiles.add(r.file);
+      return true;
+    })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
 }
