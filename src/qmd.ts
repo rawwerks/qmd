@@ -62,6 +62,7 @@ import {
   structuredSearch,
   addLineNumbers,
   type ExpandedQuery,
+  type HybridQueryExplain,
   type StructuredSubSearch,
   DEFAULT_EMBED_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -165,19 +166,20 @@ const cursor = {
 process.on('SIGINT', () => { cursor.show(); process.exit(130); });
 process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
 
-// Terminal progress bar using OSC 9;4 escape sequence
+// Terminal progress bar using OSC 9;4 escape sequence (TTY only)
+const isTTY = process.stderr.isTTY;
 const progress = {
   set(percent: number) {
-    process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;1;${Math.round(percent)}\x07`);
   },
   clear() {
-    process.stderr.write(`\x1b]9;4;0\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;0\x07`);
   },
   indeterminate() {
-    process.stderr.write(`\x1b]9;4;3\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;3\x07`);
   },
   error() {
-    process.stderr.write(`\x1b]9;4;2\x07`);
+    if (isTTY) process.stderr.write(`\x1b]9;4;2\x07`);
   },
 };
 
@@ -522,7 +524,7 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
+    await indexFiles(col.pwd, col.glob_pattern, col.name, true, yamlCol?.ignore);
     console.log("");
   }
 
@@ -1306,6 +1308,9 @@ function collectionList(): void {
 
     console.log(`${c.cyan}${coll.name}${c.reset} ${c.dim}(qmd://${coll.name}/)${c.reset}${excludeTag}`);
     console.log(`  ${c.dim}Pattern:${c.reset}  ${coll.glob_pattern}`);
+    if (yamlColl?.ignore?.length) {
+      console.log(`  ${c.dim}Ignore:${c.reset}   ${yamlColl.ignore.join(', ')}`);
+    }
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
     console.log();
@@ -1348,7 +1353,8 @@ async function collectionAdd(pwd: string, globPattern: string, name?: string): P
 
   // Create the collection and index files
   console.log(`Creating collection '${collName}'...`);
-  await indexFiles(pwd, globPattern, collName);
+  const newColl = getCollectionFromYaml(collName);
+  await indexFiles(pwd, globPattern, collName, false, newColl?.ignore);
   console.log(`${c.green}✓${c.reset} Collection '${collName}' created successfully`);
 }
 
@@ -1397,7 +1403,7 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
-async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false): Promise<void> {
+async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
@@ -1414,12 +1420,16 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
   progress.indeterminate();
+  const allIgnore = [
+    ...excludeDirs.map(d => `**/${d}/**`),
+    ...(ignorePatterns || []),
+  ];
   const allFiles: string[] = await fastGlob(globPattern, {
     cwd: resolvedPwd,
     onlyFiles: true,
     followSymbolicLinks: false,
     dot: false,
-    ignore: excludeDirs.map(d => `**/${d}/**`),
+    ignore: allIgnore,
   });
   // Filter hidden files/folders (dot: false handles top-level but not nested)
   const files = allFiles.filter(file => {
@@ -1428,11 +1438,11 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   });
 
   const total = files.length;
-  if (total === 0) {
+  const hasNoFiles = total === 0;
+  if (hasNoFiles) {
     progress.clear();
     console.log("No files found matching pattern.");
-    closeDb();
-    return;
+    // Continue so the deactivation pass can mark previously indexed docs as inactive.
   }
 
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
@@ -1444,7 +1454,15 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const path = handelize(relativeFile); // Normalize path for token-friendliness
     seenPaths.add(path);
 
-    const content = readFileSync(filepath, "utf-8");
+    let content: string;
+    try {
+      content = readFileSync(filepath, "utf-8");
+    } catch (err: any) {
+      // Skip files that can't be read (e.g. iCloud evicted files returning EAGAIN)
+      processed++;
+      progress.set((processed / total) * 100);
+      continue;
+    }
 
     // Skip empty files - nothing useful to index
     if (!content.trim()) {
@@ -1491,7 +1509,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     const rate = processed / elapsed;
     const remaining = (total - processed) / rate;
     const eta = processed > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-    process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
+    if (isTTY) process.stderr.write(`\rIndexing: ${processed}/${total}${eta}        `);
   }
 
   // Deactivate documents in this collection that no longer exist
@@ -1682,7 +1700,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const eta = elapsed > 2 ? formatETA(etaSec) : "...";
       const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
 
-      process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+      if (isTTY) process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
     }
 
     progress.clear();
@@ -1750,7 +1768,9 @@ type OutputOptions = {
   all?: boolean;
   collection?: string | string[];  // Filter by collection name(s)
   lineNumbers?: boolean; // Add line numbers to output
+  explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
+  candidateLimit?: number;  // Max candidates to rerank (default: 40)
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -1774,6 +1794,10 @@ function formatScore(score: number): string {
   return `${c.dim}${pct}%${c.reset}`;
 }
 
+function formatExplainNumber(value: number): string {
+  return value.toFixed(4);
+}
+
 // Shorten directory path for display - relative to $HOME (used for context paths, not documents)
 function shortPath(dirpath: string): string {
   const home = homedir();
@@ -1783,11 +1807,51 @@ function shortPath(dirpath: string): string {
   return dirpath;
 }
 
-function outputResults(results: { file: string; displayPath: string; title: string; body: string; score: number; context?: string | null; chunkPos?: number; hash?: string; docid?: string }[], query: string, opts: OutputOptions): void {
+type EmptySearchReason = "no_results" | "min_score";
+
+// Emit format-safe empty output for search commands.
+function printEmptySearchResults(format: OutputFormat, reason: EmptySearchReason = "no_results"): void {
+  if (format === "json") {
+    console.log("[]");
+    return;
+  }
+  if (format === "csv") {
+    console.log("docid,score,file,title,context,line,snippet");
+    return;
+  }
+  if (format === "xml") {
+    console.log("<results></results>");
+    return;
+  }
+  if (format === "md" || format === "files") {
+    return;
+  }
+
+  if (reason === "min_score") {
+    console.log("No results found above minimum score threshold.");
+    return;
+  }
+  console.log("No results found.");
+}
+
+type OutputRow = {
+  file: string;
+  displayPath: string;
+  title: string;
+  body: string;
+  score: number;
+  context?: string | null;
+  chunkPos?: number;
+  hash?: string;
+  docid?: string;
+  explain?: HybridQueryExplain;
+};
+
+function outputResults(results: OutputRow[], query: string, opts: OutputOptions): void {
   const filtered = results.filter(r => r.score >= opts.minScore).slice(0, opts.limit);
 
   if (filtered.length === 0) {
-    console.log("No results found above minimum score threshold.");
+    printEmptySearchResults(opts.format, "min_score");
     return;
   }
 
@@ -1812,6 +1876,7 @@ function outputResults(results: { file: string; displayPath: string; title: stri
         ...(row.context && { context: row.context }),
         ...(body && { body }),
         ...(snippet && { snippet }),
+        ...(opts.explain && row.explain && { explain: row.explain }),
       };
     });
     console.log(JSON.stringify(output, null, 2));
@@ -1851,6 +1916,28 @@ function outputResults(results: { file: string; displayPath: string; title: stri
       // Line 4: Score
       const score = formatScore(row.score);
       console.log(`Score: ${c.bold}${score}${c.reset}`);
+      if (opts.explain && row.explain) {
+        const explain = row.explain;
+        const ftsScores = explain.ftsScores.length > 0
+          ? explain.ftsScores.map(formatExplainNumber).join(", ")
+          : "none";
+        const vecScores = explain.vectorScores.length > 0
+          ? explain.vectorScores.map(formatExplainNumber).join(", ")
+          : "none";
+        const contribSummary = explain.rrf.contributions
+          .slice()
+          .sort((a, b) => b.rrfContribution - a.rrfContribution)
+          .slice(0, 3)
+          .map(c => `${c.source}/${c.queryType}#${c.rank}:${formatExplainNumber(c.rrfContribution)}`)
+          .join(" | ");
+
+        console.log(`${c.dim}Explain: fts=[${ftsScores}] vec=[${vecScores}]${c.reset}`);
+        console.log(`${c.dim}  RRF: total=${formatExplainNumber(explain.rrf.totalScore)} base=${formatExplainNumber(explain.rrf.baseScore)} bonus=${formatExplainNumber(explain.rrf.topRankBonus)} rank=${explain.rrf.rank}${c.reset}`);
+        console.log(`${c.dim}  Blend: ${Math.round(explain.rrf.weight * 100)}%*${formatExplainNumber(explain.rrf.positionScore)} + ${Math.round((1 - explain.rrf.weight) * 100)}%*${formatExplainNumber(explain.rerankScore)} = ${formatExplainNumber(explain.blendedScore)}${c.reset}`);
+        if (contribSummary.length > 0) {
+          console.log(`${c.dim}  Top RRF contributions: ${contribSummary}${c.reset}`);
+        }
+      }
       console.log();
 
       // Snippet with highlighting (diff-style header included)
@@ -2029,11 +2116,7 @@ function search(query: string, opts: OutputOptions): void {
   closeDb();
 
   if (resultsWithContext.length === 0) {
-    if (opts.format === "json") {
-      console.log("[]");
-    } else {
-      console.log("No results found.");
-    }
+    printEmptySearchResults(opts.format);
     return;
   }
   outputResults(resultsWithContext, query, opts);
@@ -2088,11 +2171,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     closeDb();
 
     if (results.length === 0) {
-      if (opts.format === "json") {
-        console.log("[]");
-      } else {
-        console.log("No results found.");
-      }
+      printEmptySearchResults(opts.format);
       return;
     }
 
@@ -2141,6 +2220,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         collections: singleCollection ? [singleCollection] : undefined,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
+        candidateLimit: opts.candidateLimit,
+        explain: !!opts.explain,
         hooks: {
           onEmbedStart: (count) => {
             process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
@@ -2164,6 +2245,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         collection: singleCollection,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
+        candidateLimit: opts.candidateLimit,
+        explain: !!opts.explain,
         hooks: {
           onStrongSignal: (score) => {
             process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
@@ -2205,11 +2288,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
     closeDb();
 
     if (results.length === 0) {
-      if (opts.format === "json") {
-        console.log("[]");
-      } else {
-        console.log("No results found.");
-      }
+      printEmptySearchResults(opts.format);
       return;
     }
 
@@ -2228,6 +2307,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
+      explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
@@ -2257,6 +2337,7 @@ function parseCLI() {
       xml: { type: "boolean" },
       files: { type: "boolean" },
       json: { type: "boolean" },
+      explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
       // Collection options
       name: { type: "string" },  // collection name
@@ -2271,6 +2352,8 @@ function parseCLI() {
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output
+      // Query options
+      "candidate-limit": { type: "string", short: "C" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2308,6 +2391,8 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string[] | undefined,
     lineNumbers: !!values["line-numbers"],
+    candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
+    explain: !!values.explain,
   };
 
   return {
@@ -2409,7 +2494,9 @@ function showHelp(): void {
   console.log("  --all                      - Return all matches (pair with --min-score)");
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
+  console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --line-numbers             - Include line numbers in output");
+  console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
